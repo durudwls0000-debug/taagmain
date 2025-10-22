@@ -1,0 +1,647 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>taag keyring – marquee select + group drag + delete + bg deselect</title>
+
+    <!-- Tailwind (CDN) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      .tabular-nums { font-variant-numeric: tabular-nums; }
+      .grid-paper{
+        background-image:
+          linear-gradient(rgba(0,0,0,0.05) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(0,0,0,0.05) 1px, transparent 1px);
+        background-size: 36px 36px;
+      }
+      img { -webkit-user-drag: none; user-select: none; }
+
+      /* 타일/핫존 */
+      .tile { position:absolute; touch-action:none; }
+      .tile.selected::after{
+        content:""; position:absolute; inset:-2px;
+        border:2px solid #3b82f6; border-radius:8px; pointer-events:none;
+      }
+      .handle {
+        position:absolute;
+        width:22px; height:22px; border-radius:9999px;
+        display:grid; place-items:center;
+        background: rgba(255,255,255,.88);
+        border: 1px solid rgba(0,0,0,.2);
+        box-shadow: 0 2px 6px rgba(0,0,0,.18);
+        opacity: 0; transform: scale(.9);
+        transition: opacity .12s linear, transform .12s ease;
+        user-select: none; touch-action: none;
+      }
+      .tile:hover .handle { opacity: 1; transform: scale(1); }
+
+      .handle.rotate { right:-26px; top:-26px; cursor: grab; }
+      .handle.resize { right:-6px;  bottom:-6px; cursor: nwse-resize; }
+
+      /* 닫기(TL) — 빨간 원 + 흰색 X */
+      .handle.close{
+        left:-6px; top:-6px; cursor:pointer;
+        width:22px; height:22px; border-radius:9999px;
+        background:#ef4444; border:none;
+        box-shadow: 0 2px 6px rgba(0,0,0,.18);
+      }
+      .tile:hover .handle.close{ opacity:1; transform:scale(1); }
+      .handle.close:active{ transform:scale(0.95); }
+
+      /* 마퀴(선택 박스) */
+      .marquee{
+        position:absolute; border:1px dashed #3b82f6;
+        background: rgba(59,130,246,.08); pointer-events:none;
+      }
+    </style>
+
+    <!-- React / ReactDOM (CDN) + Babel -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  </head>
+
+  <body class="bg-[#f6f7ee]">
+    <div id="root"></div>
+
+    <script type="text/babel">
+      const { useEffect, useMemo, useRef, useState } = React;
+      const clamp = (v, min, max) => Math.min(max, Math.max(min, v));
+      const rad2deg = (r) => (r * 180) / Math.PI;
+
+      const ASSETS = {
+        "Fish & Cat": "./Layer 17.png",
+        "Meowlight": "./Layer 19.png",
+        "Lucky Cats": "./Layer 20.png",
+        "Star Bear": "./Layer 21.png",
+        "Star Wing": "./Layer 22.png",
+        "Choice Taag": "./Layer 23.png",
+        "Shine Drop": "./Layer 24.png",
+      };
+
+      const CATALOG = [
+        { name: "Fish & Cat", price: 800 },
+        { name: "Meowlight",  price: 700 },
+        { name: "Lucky Cats", price: 700 },
+        { name: "Star Bear",  price: 1200 },
+        { name: "Star Wing",  price: 700 },
+        { name: "Choice Taag", price: 800 },
+        { name: "Shine Drop", price: 1100 },
+      ];
+
+      function App() {
+        const [now, setNow] = useState([
+          { name: "Fish & Cat", price: 800, count: 1 },
+          { name: "Meowlight",  price: 700, count: 2 },
+          { name: "Lucky Cats", price: 700, count: 1 },
+          { name: "Star Bear",  price: 1200, count: 1 },
+        ]);
+
+        const addList = useMemo(() => {
+          const nowNames = new Set(now.map(i => i.name));
+          return CATALOG.filter(item => !nowNames.has(item.name));
+        }, [now]);
+
+        const total = useMemo(
+          () => now.reduce((a, b) => a + b.price * b.count, 0), [now]
+        );
+
+        const flatNow = useMemo(() => {
+          const arr = [];
+          now.forEach((it, idx) => {
+            const src = ASSETS[it.name];
+            if (!src) return;
+            for (let k = 0; k < it.count; k++) {
+              arr.push({ key: `${idx}-${k}`, name: it.name, src });
+            }
+          });
+          return arr;
+        }, [now]);
+
+        const lookup = useMemo(() => {
+          const m = {};
+          flatNow.forEach(o => { m[o.key] = o; });
+          return m;
+        }, [flatNow]);
+
+        const leftRef = useRef(null);
+        const trayRef = useRef(null);
+        const [tile, setTile]     = useState(240);
+        const [positions, setPositions] = useState({});
+        const [zTop, setZTop]           = useState(1);
+
+        // 개별 드래그
+        const [dragKey, setDragKey]     = useState(null);
+        const [offsetSingle, setOffsetSingle] = useState({ x:0, y:0 });
+
+        // 그룹 선택/드래그
+        const [selected, setSelected] = useState(()=>new Set());
+        const [groupDragging, setGroupDragging] = useState(false);
+        const groupStart = useRef({ px:0, py:0, offsets:{} }); // key->(dx,dy)
+
+        // 마퀴 선택
+        const [marquee, setMarquee] = useState({ on:false, x:0, y:0, w:0, h:0, startX:0, startY:0 });
+
+        // 리사이즈/회전
+        const [resizingKey, setResizingKey] = useState(null);
+        const resizeStart = useRef({ px:0, py:0, w:0, h:0 });
+        const [rotatingKey, setRotatingKey] = useState(null);
+        const rotateStart = useRef({ angle0:0, startDeg:0 });
+
+        // 창/타일 자동 배치
+        useEffect(() => {
+          if (!leftRef.current) return;
+
+          const ro = new ResizeObserver(recalc);
+          ro.observe(leftRef.current);
+          recalc();
+
+          return () => ro.disconnect();
+
+          function recalc() {
+            const boxW = leftRef.current.clientWidth  || 800;
+            const boxH = leftRef.current.clientHeight || 600;
+
+            const margin = 24, gap = 16;
+            const minTile = 96, maxTile = 420;
+            const N = Math.max(1, flatNow.length);
+
+            let best = { cols: 1, rows: N, size: minTile };
+            for (let cols = 1; cols <= 8; cols++) {
+              const rows = Math.ceil(N / cols);
+              const sizeW = Math.floor((boxW - margin*2 - (cols-1)*gap) / cols);
+              const sizeH = Math.floor((boxH - margin*2 - (rows-1)*gap) / rows);
+              const size  = clamp(Math.min(sizeW, sizeH), minTile, maxTile);
+              if (size > best.size) best = { cols, rows, size };
+            }
+
+            const nextTile = best.size;
+            setTile(nextTile);
+
+            setPositions(prev => {
+              const next = { ...prev };
+              flatNow.forEach((it, i) => {
+                if (!next[it.key]) {
+                  const c = i % best.cols;
+                  const r = Math.floor(i / best.cols);
+                  next[it.key] = {
+                    x: margin + c * (nextTile + gap),
+                    y: margin + r * (nextTile + gap),
+                    z: i + 1,
+                    w: nextTile,
+                    h: nextTile,
+                    angle: 0,
+                    userSized: false,
+                  };
+                } else if (!next[it.key].userSized) {
+                  next[it.key].w = nextTile;
+                  next[it.key].h = nextTile;
+                }
+              });
+              Object.keys(next).forEach(k => {
+                if (!flatNow.find(x => x.key === k)) delete next[k];
+              });
+              return next;
+            });
+          }
+        }, [flatNow]);
+
+        // 키보드 Delete/Backspace로 선택 삭제
+        useEffect(() => {
+          const onKey = (e) => {
+            if (e.key === 'Delete' || e.key === 'Backspace') {
+              if (selected.size > 0) {
+                deleteSelected();
+                e.preventDefault();
+              }
+            }
+            if (e.key === 'Escape') {
+              setSelected(new Set());
+            }
+          };
+          window.addEventListener('keydown', onKey);
+          return () => window.removeEventListener('keydown', onKey);
+        }, [selected, lookup]);
+
+        const deleteSelected = () => {
+          if (selected.size === 0) return;
+          const byName = {};
+          selected.forEach(key => {
+            const item = lookup[key];
+            if (!item) return;
+            byName[item.name] = (byName[item.name] || 0) + 1;
+          });
+          setNow(prev => {
+            const arr = prev.map(it => {
+              const n = byName[it.name] || 0;
+              if (n === 0) return it;
+              const nextCount = Math.max(0, it.count - n);
+              return { ...it, count: nextCount };
+            }).filter(it => it.count > 0);
+            return arr;
+          });
+          setSelected(new Set());
+        };
+
+        /* ---------- 헬퍼 ---------- */
+        const getRect = () => trayRef.current.getBoundingClientRect();
+
+        /* ---------- ✅ 배경 포인터다운: 즉시 선택 해제 + 마퀴 시작 ---------- */
+        const onTrayPointerDown = (e) => {
+          if (!trayRef.current) return;
+          // 타일/핸들 위라면 배경 처리 안 함
+          if (e.target.closest('.tile')) return;
+
+          const rect = getRect();
+          const x = e.clientX - rect.left;
+          const y = e.clientY - rect.top;
+
+          // 1) 즉시 선택 해제
+          setSelected(new Set());
+          // 2) 마퀴 시작
+          setMarquee({ on:true, x, y, w:0, h:0, startX:x, startY:y });
+
+          e.currentTarget.setPointerCapture?.(e.pointerId);
+        };
+
+        /* ---------- 트레이 Move: 마퀴 업데이트 + 그룹 드래그 이동(빈배경 아님) ---------- */
+        const onTrayPointerMove = (e) => {
+          if (!trayRef.current) return;
+          const rect = getRect();
+          const lx = e.clientX - rect.left;
+          const ly = e.clientY - rect.top;
+
+          // 그룹 드래그는 "선택된 타일을 잡고" 시작하는 로직에서 처리됨
+          // 여기서는 마퀴만 처리
+          if (marquee.on) {
+            const x0 = marquee.startX, y0 = marquee.startY;
+            const x = Math.min(x0, lx), y = Math.min(y0, ly);
+            const w = Math.abs(lx - x0), h = Math.abs(ly - y0);
+            setMarquee(prev => ({ ...prev, x, y, w, h }));
+
+            // 충돌 체크로 선택 갱신
+            const hit = new Set();
+            flatNow.forEach(it => {
+              const p = positions[it.key]; if (!p) return;
+              const a = { x, y, w, h };
+              const b = { x: p.x, y: p.y, w: p.w, h: p.h };
+              const intersect = !(a.x+a.w < b.x || b.x+b.w < a.x || a.y+a.h < b.y || b.y+b.h < a.y);
+              if (intersect) hit.add(it.key);
+            });
+            setSelected(hit);
+          }
+        };
+
+        const onTrayPointerUp = (e) => {
+          if (marquee.on) setMarquee(m => ({ ...m, on:false, w:0, h:0 }));
+          try { e.currentTarget.releasePointerCapture?.(e.pointerId); } catch {}
+        };
+
+        /* ---------- 타일 선택 토글(Ctrl/Cmd) + 단일선택 ---------- */
+        const toggleSelect = (e, key) => {
+          if (e.metaKey || e.ctrlKey) {
+            e.stopPropagation();
+            setSelected(prev => {
+              const n = new Set(prev);
+              if (n.has(key)) n.delete(key); else n.add(key);
+              return n;
+            });
+          } else {
+            setSelected(new Set([key]));
+          }
+        };
+
+        /* ---------- 개별/그룹 드래그 ---------- */
+        const startDrag = (e, key) => {
+          if (!trayRef.current) return;
+          if (resizingKey || rotatingKey) return;
+
+          // 선택이 안 되어 있으면 이 타일만 선택
+          if (!selected.has(key)) setSelected(new Set([key]));
+
+          const rect = getRect();
+          const pos  = positions[key];
+
+          // 선택이 여러 개면 그룹 드래그 시작
+          if (selected.size > 1) {
+            setGroupDragging(true);
+            const x0 = e.clientX - rect.left, y0 = e.clientY - rect.top;
+            groupStart.current = {
+              px: e.clientX, py: e.clientY,
+              offsets: Object.fromEntries([...selected].map(k => {
+                const p = positions[k];
+                return [k, { dx: p.x - x0, dy: p.y - y0 }];
+              }))
+            };
+          } else {
+            // 단일 드래그
+            setDragKey(key);
+            setOffsetSingle({ x: e.clientX - rect.left - pos.x, y: e.clientY - rect.top - pos.y });
+          }
+
+          // zIndex 올리기
+          setPositions(p => ({ ...p, [key]: { ...p[key], z: zTop + 1 } }));
+          setZTop(z => z + 1);
+          e.currentTarget.setPointerCapture?.(e.pointerId);
+        };
+
+        const onPointerMoveItem = (e) => {
+          if (!trayRef.current) return;
+
+          // 그룹 드래그
+          if (groupDragging) {
+            const rect = getRect();
+            const lx = e.clientX - rect.left;
+            const ly = e.clientY - rect.top;
+            const { offsets } = groupStart.current;
+            setPositions(prev => {
+              const next = { ...prev };
+              Object.keys(offsets).forEach(key => {
+                const p = prev[key];
+                if (!p) return;
+                const W = p.w, H = p.h;
+                const x = clamp(lx + offsets[key].dx, 0, rect.width  - W);
+                const y = clamp(ly + offsets[key].dy, 0, rect.height - H);
+                next[key] = { ...p, x, y };
+              });
+              return next;
+            });
+            return;
+          }
+
+          // 단일 드래그
+          if (!dragKey) return;
+          const rect = getRect();
+          const cur = positions[dragKey] || { w: tile, h: tile };
+          const W = cur.w ?? tile, H = cur.h ?? tile;
+          const x = clamp(e.clientX - rect.left - offsetSingle.x, 0, rect.width  - W);
+          const y = clamp(e.clientY - rect.top  - offsetSingle.y, 0, rect.height - H);
+          setPositions(p => ({ ...p, [dragKey]: { ...p[dragKey], x, y } }));
+        };
+
+        const endAll = (e) => {
+          setDragKey(null);
+          setGroupDragging(false);
+          setResizingKey(null);
+          setRotatingKey(null);
+          try { e.currentTarget.releasePointerCapture?.(e.pointerId); } catch {}
+        };
+
+        /* ---------- 리사이즈(BR) ---------- */
+        const startResize = (e, key) => {
+          e.stopPropagation();
+          if (!positions[key]) return;
+          setResizingKey(key);
+          resizeStart.current = {
+            px: e.clientX, py: e.clientY,
+            w: positions[key].w ?? tile,
+            h: positions[key].h ?? tile,
+          };
+          setPositions(p => ({ ...p, [key]: { ...p[key], z: zTop + 1 } }));
+          setZTop(z => z + 1);
+          e.currentTarget.setPointerCapture?.(e.pointerId);
+        };
+
+        const onPointerMoveResize = (e) => {
+          if (!resizingKey) return;
+          const key = resizingKey;
+          const { px, py, w } = resizeStart.current;
+          const dx = e.clientX - px;
+          const dy = e.clientY - py;
+          const delta = Math.max(dx, dy);
+          const minSize = 72, maxSize = 640;
+          setPositions(p => {
+            const cur = p[key]; if (!cur) return p;
+            const nextSize = clamp((w ?? tile) + delta, minSize, maxSize);
+            return { ...p, [key]: { ...cur, w: nextSize, h: nextSize, userSized: true } };
+          });
+        };
+
+        /* ---------- 회전(TR) ---------- */
+        const startRotate = (e, key) => {
+          e.stopPropagation();
+          if (!positions[key] || !trayRef.current) return;
+          const rect = getRect();
+          const cur = positions[key];
+          const centerX = rect.left + cur.x + (cur.w ?? tile)/2;
+          const centerY = rect.top  + cur.y + (cur.h ?? tile)/2;
+          const startDeg = rad2deg(Math.atan2(e.clientY - centerY, e.clientX - centerX));
+          const angle0 = cur.angle || 0;
+          rotateStart.current = { angle0, startDeg };
+          setRotatingKey(key);
+          setPositions(p => ({ ...p, [key]: { ...p[key], z: zTop + 1 } }));
+          setZTop(z => z + 1);
+          e.currentTarget.setPointerCapture?.(e.pointerId);
+        };
+
+        const onPointerMoveRotate = (e) => {
+          if (!rotatingKey || !trayRef.current) return;
+          const key = rotatingKey;
+          setPositions(p => {
+            const cur = p[key]; if (!cur) return p;
+            const rect = getRect();
+            const cx = rect.left + cur.x + (cur.w ?? tile)/2;
+            const cy = rect.top  + cur.y + (cur.h ?? tile)/2;
+            const curDeg = rad2deg(Math.atan2(e.clientY - cy, e.clientX - cx));
+            const nextAngle = (rotateStart.current.angle0 + (curDeg - rotateStart.current.startDeg)) % 360;
+            return { ...p, [key]: { ...cur, angle: nextAngle } };
+          });
+        };
+
+        /* ---------- 삭제(TL) ---------- */
+        const removeOne = (name) => {
+          setNow(p => {
+            const i = p.findIndex(x => x.name === name);
+            if (i < 0) return p;
+            const next = [...p];
+            const newCount = Math.max(0, next[i].count - 1);
+            if (newCount === 0) next.splice(i, 1); else next[i] = { ...next[i], count: newCount };
+            return next;
+          });
+        };
+
+        /* 수량/추가 */
+        const dec = (i) =>
+          setNow(p =>
+            p.map((x, idx) => (idx === i ? { ...x, count: Math.max(0, x.count - 1) } : x))
+             .filter(x => x.count > 0)
+          );
+        const inc = (i) => setNow(p => p.map((x, idx) => (idx === i ? { ...x, count: x.count + 1 } : x)));
+        const addToNow = (item) =>
+          setNow(p => {
+            const i = p.findIndex(x => x.name === item.name);
+            return i >= 0
+              ? p.map((x, idx) => (idx === i ? { ...x, count: x.count + 1 } : x))
+              : [...p, { ...item, count: 1 }];
+          });
+
+        return (
+          <div className="min-h-screen flex">
+            {/* LEFT 50% */}
+            <section ref={leftRef} className="flex-1 relative grid-paper overflow-hidden select-none">
+              {/* 선택 툴바 */}
+              {selected.size > 0 && (
+                <div className="absolute top-3 left-3 z-[999] flex items-center gap-2">
+                  <button
+                    className="px-3 py-1.5 rounded-full bg-red-500 text-white text-sm shadow"
+                    onClick={deleteSelected}
+                    title="선택 삭제 (Del/Backspace)"
+                  >선택 삭제</button>
+                  <span className="text-xs bg-white/80 border rounded-full px-2 py-0.5">{selected.size}개 선택</span>
+                </div>
+              )}
+
+              <div
+                ref={trayRef}
+                className="absolute inset-0 w-full h-full"
+                onPointerDown={onTrayPointerDown}
+                onPointerMove={(e)=>{ onTrayPointerMove(e); onPointerMoveResize(e); onPointerMoveRotate(e); }}
+                onPointerUp={onTrayPointerUp}
+                onPointerCancel={onTrayPointerUp}
+              >
+                {/* 마퀴(선택 박스) */}
+                {marquee.on && (
+                  <div className="marquee" style={{
+                    left: marquee.x, top: marquee.y, width: marquee.w, height: marquee.h
+                  }} />
+                )}
+
+                {flatNow.map((it) => {
+                  const pos = positions[it.key] || { x: 24, y: 24, z: 1, w: tile, h: tile, angle: 0 };
+                  const isSel = selected.has(it.key);
+                  return (
+                    <div
+                      key={it.key}
+                      className={`tile ${isSel ? 'selected' : ''}`}
+                      style={{ left: pos.x, top: pos.y, zIndex: pos.z, width: pos.w, height: pos.h, borderRadius: 8 }}
+                      onPointerDown={(e)=>toggleSelect(e, it.key)}
+                    >
+                      {/* 드래그(단일/그룹) */}
+                      <div
+                        className="w-full h-full cursor-grab active:cursor-grabbing"
+                        onPointerDown={(e)=>startDrag(e, it.key)}
+                        onPointerMove={onPointerMoveItem}
+                        onPointerUp={endAll}
+                        onPointerCancel={endAll}
+                        style={{
+                          transform: `rotate(${pos.angle || 0}deg)`,
+                          transformOrigin: 'center center'
+                        }}
+                      >
+                        <img
+                          src={it.src}
+                          alt=""
+                          aria-hidden="true"
+                          className="w-full h-full object-contain pointer-events-none"
+                          draggable="false"
+                        />
+                      </div>
+
+                      {/* 닫기(TL) — 빨간 원 + 흰색 X */}
+                      <div
+                        className="handle close"
+                        onPointerDown={(e)=>{ e.stopPropagation(); removeOne(it.name); }}
+                        aria-label="삭제" title="삭제"
+                      >
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none"
+                             stroke="#ffffff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <line x1="18" y1="6" x2="6"  y2="18"></line>
+                          <line x1="6"  y1="6" x2="18" y2="18"></line>
+                        </svg>
+                      </div>
+
+                      {/* 회전(TR) */}
+                      <div className="handle rotate" onPointerDown={(e)=>startRotate(e, it.key)} aria-label="회전" title="회전">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+                             stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+                             style={{opacity:.9}}>
+                          <path d="M21 12a 9 9 0 1 1-2.64-6.36"></path>
+                          <polyline points="21 3 21 9 15 9"></polyline>
+                        </svg>
+                      </div>
+
+                      {/* 리사이즈(BR) */}
+                      <div className="handle resize" onPointerDown={(e)=>startResize(e, it.key)} aria-label="크기 조절" title="크기 조절">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+                             stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+                             style={{opacity:.9}}>
+                          <polyline points="7 17 17 7"></polyline>
+                          <polyline points="10 7 17 7 17 14"></polyline>
+                        </svg>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+
+            {/* RIGHT 50% */}
+            <aside className="flex-1 bg-white border-l border-black/10 p-10 flex flex-col justify-between">
+              <div>
+                <div className="grid grid-cols-[1fr_1fr] gap-8 mb-10">
+                  {/* NOW */}
+                  <div className="rounded-3xl border border-black/10 bg-gradient-to-b from-[#EEF6C9] to-[#F3F9E4] p-6 shadow-sm">
+                    <h2 className="text-2xl font-extrabold mb-4">NOW</h2>
+                    {now.map((it, i) => (
+                      <div key={i} className="flex items-center justify-between mb-2 whitespace-nowrap">
+                        <div className="flex items-center gap-3">
+                          <button onClick={() => {
+                            setSelected(new Set());
+                            setTimeout(()=>{},0);
+                          }} className="hidden"></button>
+                          <button onClick={() => {
+                            setSelected(new Set());
+                            setTimeout(()=>{},0);
+                            // 감소
+                            setNow(p=>p.map((x,idx)=>idx===i?{...x,count:Math.max(0,x.count-1)}:x).filter(x=>x.count>0));
+                          }} className="px-2 border rounded">-</button>
+                          <span className="tabular-nums">{it.count}</span>
+                          <button onClick={() => { setSelected(new Set()); setNow(p=>p.map((x,idx)=>idx===i?{...x,count:x.count+1}:x)); }} className="px-2 border rounded">+</button>
+                          <span className="max-w-[320px] overflow-hidden text-ellipsis whitespace-nowrap">{it.name}</span>
+                        </div>
+                        <span className="tabular-nums">¥{it.price.toLocaleString()}</span>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* ADD */}
+                  <div>
+                    <h2 className="text-2xl font-extrabold mb-4">ADD</h2>
+                    {addList.map((it) => (
+                      <button
+                        key={it.name}
+                        onClick={() => { setSelected(new Set()); setNow(p=> {
+                          const idx = p.findIndex(x=>x.name===it.name);
+                          return idx>=0 ? p.map((x,i)=>i===idx?{...x,count:x.count+1}:x) : [...p,{...it,count:1}];
+                        }); }}
+                        className="flex justify-between w-full border-b py-2 hover:bg-[#FAFCF2] whitespace-nowrap"
+                      >
+                        <span className="max-w-[320px] overflow-hidden text-ellipsis whitespace-nowrap">{it.name}</span>
+                        <span className="tabular-nums">¥{it.price.toLocaleString()}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-4">
+                <button className="w-full bg-black text-white py-4 rounded-full font-bold text-lg">カートに追加する</button>
+                <button className="w-full border border-black py-4 rounded-full font-semibold">お気に入りに追加</button>
+                <div className="border rounded-2xl p-6 mt-3">
+                  <div className="text-3xl font-black mb-3">taag</div>
+                  <div className="border-t pt-4 flex justify-between text-base">
+                    <span>TOTAL</span>
+                    <span className="font-semibold tabular-nums">¥{total.toLocaleString()}</span>
+                  </div>
+                </div>
+              </div>
+            </aside>
+          </div>
+        );
+      }
+
+      ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+    </script>
+  </body>
+</html>
